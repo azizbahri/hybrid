@@ -1,0 +1,22 @@
+# Local caches / downloads
+.cache/
+.bin/
+models/
+vendor/
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Reports / logs
+reports/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
