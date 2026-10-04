@@ -65,12 +65,18 @@ MAX_CAPTURE_BYTES = 256 * 1024
 # Shorter than a full interactive session; hung llama-cli must not linger.
 DEFAULT_LLM_TIMEOUT_SEC = 120
 DEFAULT_CMD_TIMEOUT_SEC = 60
+DEFAULT_NPU_TIMEOUT_SEC = 180
 # Refuse GPU smoke when free VRAM is below this (MiB). Cursor + Vulkan share
 # the same 512 MiB iGPU pool on this class of hardware.
 MIN_FREE_VRAM_MIB = 128
 # "auto" ngl caps for small discrete/shared heaps.
 NGL_AUTO_TINY_MIB = 768  # <= this → very conservative offload
 NGL_AUTO_SMALL_MIB = 2048
+
+# Preferred FLM NPU smoke model (small XDNA2 artifact).
+DEFAULT_FLM_MODEL = "qwen3:0.6b"
+FLM_SERVE_HOST = "127.0.0.1"
+FLM_SERVE_PORT = 8099
 
 
 @dataclass
@@ -578,51 +584,190 @@ def run_vulkan_llm(
     return result
 
 
-def run_npu_optional() -> dict:
-    flm = shutil.which("flm")
+def find_flm() -> str | None:
+    """Locate flm, including common user-local portable installs."""
+    found = shutil.which("flm")
+    if found:
+        return found
+    candidates = [
+        Path.home() / ".local/bin/flm",
+        Path.home() / ".local/share/fastflowlm/flm",
+    ]
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
+
+
+def _flm_installed_models(flm: str) -> list[str]:
+    p = run([flm, "list", "-j", "--filter", "installed"], timeout=DEFAULT_CMD_TIMEOUT_SEC)
+    if p.returncode != 0 or not (p.stdout or "").strip():
+        # Fallback: parse plain list for checkmarks / local paths.
+        p2 = run([flm, "list", "--filter", "installed"], timeout=DEFAULT_CMD_TIMEOUT_SEC)
+        text = (p2.stdout or "") + "\n" + (p2.stderr or "")
+        return re.findall(r"^\s*-\s*([A-Za-z0-9._:-]+)", text, re.M)
+
+    try:
+        data = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    models = data.get("models", data if isinstance(data, list) else [])
+    out: list[str] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        if item.get("installed") is False:
+            continue
+        name = item.get("model") or item.get("name") or item.get("id")
+        if name:
+            out.append(str(name))
+    return out
+
+
+def _wait_http_ok(url: str, timeout_sec: float = 60.0) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+        except Exception:  # noqa: BLE001 - probe loop
+            time.sleep(0.5)
+    return False
+
+
+def run_npu_optional(model: str = DEFAULT_FLM_MODEL) -> dict:
+    """Run a short NPU completion via FastFlowLM OpenAI-compatible serve API."""
+    flm = find_flm()
     if not flm:
         return {
             "backend": "flm",
             "skipped": True,
-            "reason": "flm not installed",
+            "reason": "flm not installed (install portable FastFlowLM to ~/.local)",
             "ok": True,  # soft skip
         }
 
-    # FLM model catalogs differ by install; keep this best-effort and non-fatal.
-    # Try a tiny validate/list path first.
-    p_list = run([flm, "list"], timeout=DEFAULT_CMD_TIMEOUT_SEC)
-    result = {
-        "backend": "flm",
-        "skipped": False,
-        "flm_path": flm,
-        "list_exit": p_list.returncode,
-        "list_tail": ((p_list.stdout or "") + (p_list.stderr or ""))[-1500:],
-        "ok": False,
-    }
+    p_val = run([flm, "validate"], timeout=DEFAULT_CMD_TIMEOUT_SEC)
+    validate_ok = p_val.returncode == 0 and "/dev/accel" in ((p_val.stdout or "") + (p_val.stderr or ""))
+    installed = _flm_installed_models(flm)
+    if model not in installed:
+        # Prefer the requested tiny model; otherwise first installed.
+        if installed:
+            model = installed[0]
+        else:
+            log(f"pulling FLM model {DEFAULT_FLM_MODEL}")
+            p_pull = run(
+                [flm, "pull", DEFAULT_FLM_MODEL],
+                timeout=600,
+            )
+            if p_pull.returncode != 0:
+                return {
+                    "backend": "flm",
+                    "skipped": True,
+                    "reason": f"flm pull failed for {DEFAULT_FLM_MODEL}",
+                    "ok": True,
+                    "flm_path": flm,
+                    "validate_ok": validate_ok,
+                    "pull_stderr_tail": (p_pull.stderr or "")[-1500:],
+                }
+            model = DEFAULT_FLM_MODEL
 
-    # Prefer an explicit tiny model if present in list output.
-    text = (p_list.stdout or "") + "\n" + (p_list.stderr or "")
-    candidates = re.findall(r"(qwen[^\s]+|llama[^\s]+|phi[^\s]+)", text, re.I)
-    model = candidates[0] if candidates else None
-    if not model:
-        result["skipped"] = True
-        result["reason"] = "no FLM model found via `flm list`"
-        result["ok"] = True
-        return result
-
-    p = run([flm, "run", model, "-p", PROMPT, "-n", "16"], timeout=DEFAULT_LLM_TIMEOUT_SEC)
-    combined = (p.stdout or "") + "\n" + (p.stderr or "")
-    result.update(
-        {
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    serve_log = REPORTS / "flm-serve.log"
+    port = FLM_SERVE_PORT
+    base = f"http://{FLM_SERVE_HOST}:{port}"
+    serve_cmd = [
+        flm,
+        "serve",
+        model,
+        "--host",
+        FLM_SERVE_HOST,
+        "-p",
+        str(port),
+        "--quiet",
+    ]
+    log(f"+ {' '.join(serve_cmd)}")
+    with open(serve_log, "wb") as logf:
+        proc = subprocess.Popen(
+            serve_cmd,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            text=False,
+        )
+        result = {
+            "backend": "flm",
+            "skipped": False,
+            "flm_path": flm,
             "model": model,
-            "exit_code": p.returncode,
-            "ok": p.returncode == 0,
-            "stdout_tail": (p.stdout or "")[-1500:],
-            "stderr_tail": (p.stderr or "")[-1500:],
-            "output_has_prompt_echo": PROMPT[:10] in combined,
+            "validate_ok": validate_ok,
+            "serve_port": port,
+            "serve_log": str(serve_log),
+            "ok": False,
         }
-    )
-    return result
+        try:
+            if not _wait_http_ok(f"{base}/v1/models", timeout_sec=90):
+                result["reason"] = "flm serve did not become ready"
+                result["serve_tail"] = serve_log.read_text(encoding="utf-8", errors="replace")[-2000:]
+                return result
+
+            payload = json.dumps(
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": PROMPT}],
+                    "max_tokens": 24,
+                    "temperature": 0,
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base}/v1/chat/completions",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            started = time.time()
+            with urllib.request.urlopen(req, timeout=DEFAULT_NPU_TIMEOUT_SEC) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                status = resp.status
+            elapsed = time.time() - started
+            data = json.loads(body)
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            usage = data.get("usage") or {}
+            ok = status == 200 and bool(content.strip())
+            result.update(
+                {
+                    "ok": ok,
+                    "http_status": status,
+                    "elapsed_sec": round(elapsed, 3),
+                    "content": content[:500],
+                    "usage": {
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "prefill_speed_tps": usage.get("prefill_speed_tps"),
+                        "decoding_speed_tps": usage.get("decoding_speed_tps"),
+                    },
+                    "npu_engaged": "NPU Locked" in serve_log.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    or bool(usage.get("decoding_speed_tps")),
+                }
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            result["reason"] = f"flm NPU request failed: {exc}"
+            result["serve_tail"] = serve_log.read_text(encoding="utf-8", errors="replace")[-2000:]
+            return result
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 def write_report(report: dict) -> Path:
@@ -641,11 +786,12 @@ def summarize(report: dict) -> int:
     llm = report["vulkan_llm"]
     npu = report["npu"]
 
+    npu_ok = bool(npu.get("ok")) and not npu.get("skipped")
     if llm.get("skipped"):
-        # Intentional --skip-llm (ok=True): judge hardware only.
-        # Safety refusal (ok=False): hard fail.
-        hard_ok = False
-        soft_ok = bool(hw.get("hybrid_ready_cpu_gpu") and llm.get("ok"))
+        # Intentional --skip-llm (ok=True): NPU-only or hardware probe.
+        # Safety refusal (ok=False): hard fail unless NPU path still passed.
+        hard_ok = bool(hw.get("npu") and npu_ok)
+        soft_ok = bool(hw.get("hybrid_ready_cpu_gpu") and llm.get("ok") and hw.get("npu"))
     else:
         hard_ok = (
             hw.get("hybrid_ready_cpu_gpu")
@@ -654,6 +800,7 @@ def summarize(report: dict) -> int:
         )
         # If GPU offload wasn't detected but inference succeeded, treat as soft warning.
         soft_ok = hw.get("hybrid_ready_cpu_gpu") and llm.get("ok")
+        # NPU success alongside GPU is bonus, not required for hard pass.
 
     log("\n=== SMOKE SUMMARY ===")
     log(f"CPU:          {'PASS' if hw.get('cpu') else 'FAIL'} — {report['hardware']['cpu'].get('model')}")
@@ -671,21 +818,31 @@ def summarize(report: dict) -> int:
     if npu.get("skipped"):
         log(f"NPU infer:    SKIP — {npu.get('reason')}")
     else:
-        log(f"NPU infer:    {'PASS' if npu.get('ok') else 'FAIL'}")
+        usage = npu.get("usage") or {}
+        log(
+            f"NPU infer:    {'PASS' if npu.get('ok') else 'FAIL'} "
+            f"(model={npu.get('model')}, "
+            f"decode_tps={usage.get('decoding_speed_tps')}, "
+            f"npu_engaged={npu.get('npu_engaged')})"
+        )
 
     report["summary"] = {
         "hard_pass": bool(hard_ok),
         "soft_pass": bool(soft_ok),
         "npu_device_ok": bool(hw.get("npu")),
+        "npu_infer_ok": bool(npu_ok),
     }
 
-    if hard_ok:
+    if hard_ok and not llm.get("skipped"):
         log("RESULT: PASS (CPU+GPU hybrid offload verified)")
+        return 0
+    if hard_ok and llm.get("skipped") and npu_ok:
+        log("RESULT: PASS (NPU inference verified; Vulkan LLM skipped)")
         return 0
     if soft_ok:
         log("RESULT: PASS_WITH_WARNINGS (LLM ok, GPU offload not clearly detected)")
         return 0
-    if llm.get("skipped") and report.get("vram_preflight", {}).get("ok") is False:
+    if llm.get("skipped") and llm.get("ok") is False and report.get("vram_preflight", {}).get("ok") is False:
         log("RESULT: FAIL (refused GPU smoke — VRAM / concurrency safety)")
         return 4
     log("RESULT: FAIL")
@@ -733,6 +890,11 @@ def main() -> int:
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--skip-llm", action="store_true")
     parser.add_argument("--skip-npu-infer", action="store_true")
+    parser.add_argument(
+        "--flm-model",
+        default=DEFAULT_FLM_MODEL,
+        help=f"FastFlowLM NPU model tag (default: {DEFAULT_FLM_MODEL})",
+    )
     args = parser.parse_args()
 
     if platform.machine() not in {"x86_64", "AMD64"}:
@@ -805,7 +967,7 @@ def main() -> int:
             report["npu"] = {"skipped": True, "reason": "cli flag", "ok": True}
         else:
             log("== optional NPU inference ==")
-            report["npu"] = run_npu_optional()
+            report["npu"] = run_npu_optional(model=args.flm_model)
 
         code = summarize(report)
         path = write_report(report)

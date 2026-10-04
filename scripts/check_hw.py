@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -135,10 +136,24 @@ def npu_info() -> dict:
             info["firmware_hint"] = str(candidate)
             break
 
-    code, _, _ = _run(["flm", "--help"], timeout=5)
-    info["flm_present"] = code in (0, 1, 2)  # help may exit non-zero
-    if code == 127:
+    flm = shutil.which("flm")
+    if not flm:
+        for candidate in (
+            Path.home() / ".local/bin/flm",
+            Path.home() / ".local/share/fastflowlm/flm",
+        ):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                flm = str(candidate)
+                break
+    info["flm_path"] = flm
+    if flm:
+        code, out, err = _run([flm, "validate"], timeout=15)
+        text = (out or "") + (err or "")
+        info["flm_present"] = code == 0
+        info["flm_validate_ok"] = code == 0 and "/dev/accel" in text
+    else:
         info["flm_present"] = False
+        info["flm_validate_ok"] = False
 
     return info
 
